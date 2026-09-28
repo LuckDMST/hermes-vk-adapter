@@ -2,7 +2,9 @@
 
 import asyncio
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import dataclass
@@ -27,6 +29,14 @@ def _install_import_stubs():
     agent.secret_scope = secret_scope
     sys.modules["agent"] = agent
     sys.modules["agent.secret_scope"] = secret_scope
+
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.__path__ = []
+    hermes_config = types.ModuleType("hermes_cli.config")
+    hermes_config.get_hermes_home = lambda: Path("/tmp/hermes-test-home")
+    hermes_cli.config = hermes_config
+    sys.modules["hermes_cli"] = hermes_cli
+    sys.modules["hermes_cli.config"] = hermes_config
 
     gateway = types.ModuleType("gateway")
     gateway.__path__ = []
@@ -96,6 +106,82 @@ spec.loader.exec_module(adapter)
 
 
 class VkProtocolTests(unittest.TestCase):
+    def test_cursor_uses_hermes_home_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"VK_STATE_DIR": ""}), patch.object(adapter, "get_hermes_home", return_value=Path(home)):
+            instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+            instance.group_id = "987654321"
+            expected = Path(home) / "plugin-data" / "vk-platform" / "vk-long-poll-987654321.json"
+            self.assertEqual(Path(instance._state_path()), expected)
+            instance._ts = "123456"
+            instance._save_ts()
+            self.assertTrue(expected.is_file())
+            self.assertEqual(instance._load_ts(), "123456")
+
+    def test_cursor_absolute_override_round_trips_and_relative_is_rejected(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(adapter, "get_hermes_home", return_value=Path(home) / "unused"):
+            instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+            instance.group_id = "987654321"
+            override = str(Path(home) / "custom-state")
+            with patch.dict(os.environ, {"VK_STATE_DIR": override}):
+                expected = Path(override) / "vk-long-poll-987654321.json"
+                self.assertEqual(Path(instance._state_path()), expected)
+                instance._ts = "654321"
+                instance._save_ts()
+                self.assertEqual(instance._load_ts(), "654321")
+            with patch.dict(os.environ, {"VK_STATE_DIR": "relative-state"}), self.assertRaisesRegex(ValueError, "absolute path"):
+                instance._state_path()
+            with patch.dict(os.environ, {"VK_STATE_DIR": "~/vk-state"}):
+                self.assertEqual(Path(instance._state_path()).parent, Path.home() / "vk-state")
+
+    def test_legacy_cursor_is_read_once_from_hermes_home_and_new_writes_use_plugin_data(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"VK_STATE_DIR": ""}), patch.object(adapter, "get_hermes_home", return_value=Path(home)):
+            instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+            instance.group_id = "987654321"
+            legacy = Path(home) / "vk-long-poll-987654321.json"
+            legacy.write_text('{"ts":"111"}', encoding="utf-8")
+            self.assertEqual(instance._load_ts(), "111")
+            instance._ts = "222"
+            instance._save_ts()
+            self.assertEqual(instance._load_ts(), "222")
+            self.assertEqual(legacy.read_text(encoding="utf-8"), '{"ts":"111"}')
+            self.assertTrue((Path(home) / "plugin-data" / "vk-platform" / legacy.name).is_file())
+
+    def test_fixed_legacy_cursor_migrates_when_hermes_home_differs(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"VK_STATE_DIR": ""}):
+            home = Path(root) / "home"
+            legacy_dir = Path(root) / "old-opt-data"
+            home.mkdir()
+            legacy_dir.mkdir()
+            with patch.object(adapter, "get_hermes_home", return_value=home), patch.object(adapter, "_LEGACY_STATE_DIR", legacy_dir):
+                instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+                instance.group_id = "987654321"
+                legacy = legacy_dir / "vk-long-poll-987654321.json"
+                legacy.write_text('{"ts":"111"}', encoding="utf-8")
+                self.assertEqual(instance._load_ts(), "111")
+                instance._ts = "222"
+                instance._save_ts()
+                self.assertEqual(instance._load_ts(), "222")
+                self.assertEqual(legacy.read_text(encoding="utf-8"), '{"ts":"111"}')
+                self.assertTrue((home / "plugin-data" / "vk-platform" / legacy.name).is_file())
+
+    def test_same_home_and_fixed_legacy_path_is_read_once(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"VK_STATE_DIR": ""}), patch.object(adapter, "get_hermes_home", return_value=Path(home)), patch.object(adapter, "_LEGACY_STATE_DIR", Path(home)):
+            instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+            instance.group_id = "987654321"
+            with patch("builtins.open", side_effect=FileNotFoundError) as reader:
+                self.assertEqual(instance._load_ts(), "")
+            self.assertEqual(reader.call_count, 2)
+
+    def test_override_does_not_read_legacy_cursor_from_hermes_home(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(adapter, "get_hermes_home", return_value=Path(home)), patch.object(adapter, "_LEGACY_STATE_DIR", Path(home) / "old-opt-data"):
+            instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+            instance.group_id = "987654321"
+            (Path(home) / "vk-long-poll-987654321.json").write_text('{"ts":"111"}', encoding="utf-8")
+            adapter._LEGACY_STATE_DIR.mkdir()
+            (adapter._LEGACY_STATE_DIR / "vk-long-poll-987654321.json").write_text('{"ts":"333"}', encoding="utf-8")
+            with patch.dict(os.environ, {"VK_STATE_DIR": str(Path(home) / "override")}):
+                self.assertEqual(instance._load_ts(), "")
+
     def test_split_preserves_unicode_text_and_respects_limit(self):
         text = ("Привет 😀 мир\n" * 9) + ("я" * 31)
         chunks = adapter.split_vk_message(text, limit=17)

@@ -17,6 +17,7 @@ import secrets
 import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
@@ -25,6 +26,7 @@ from urllib.request import Request, urlopen
 from agent.secret_scope import UnscopedSecretError, get_secret as scoped_get_secret
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from hermes_cli.config import get_hermes_home
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ VK_LONG_POLL_TIMEOUT = 35
 _MAX_RECENT_EVENTS = 2048
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 60.0
+# Read-only migration source for releases that hardcoded /opt/data, even when HERMES_HOME differs.
+_LEGACY_STATE_DIR = Path("/opt/data")
 
 
 class VkTransportError(Exception):
@@ -353,25 +357,42 @@ class VkAdapter(BasePlatformAdapter):
         return {"server": server, "key": key, "ts": str(ts)}
 
     def _state_path(self) -> str:
-        return f"/opt/data/vk-long-poll-{int(self.group_id)}.json"
+        override = os.getenv("VK_STATE_DIR", "").strip()
+        directory = Path(override).expanduser() if override else Path(get_hermes_home()) / "plugin-data" / "vk-platform"
+        if not directory.is_absolute():
+            raise ValueError("VK_STATE_DIR must be an absolute path")
+        return str(directory / f"vk-long-poll-{int(self.group_id)}.json")
 
     def _load_ts(self) -> str:
-        try:
-            with open(self._state_path(), "r", encoding="utf-8") as state_file:
-                state = json.load(state_file)
-            ts = str(state.get("ts", ""))
-            return ts if ts.isdecimal() else ""
-        except (OSError, ValueError, TypeError):
-            return ""
+        paths = [self._state_path()]
+        if not os.getenv("VK_STATE_DIR", "").strip():
+            filename = f"vk-long-poll-{int(self.group_id)}.json"
+            for directory in (Path(get_hermes_home()), _LEGACY_STATE_DIR):
+                candidate = str(directory / filename)
+                if candidate not in paths:
+                    paths.append(candidate)
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as state_file:
+                    state = json.load(state_file)
+                ts = str(state.get("ts", ""))
+                return ts if ts.isdecimal() else ""
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, TypeError):
+                return ""
+        return ""
 
     def _save_ts(self) -> None:
         if not self._ts.isdecimal():
             return
         path = self._state_path()
         directory = os.path.dirname(path)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=".vk-long-poll-", dir=directory)
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as state_file:
                 json.dump({"group_id": self.group_id, "ts": self._ts}, state_file)
                 state_file.flush()

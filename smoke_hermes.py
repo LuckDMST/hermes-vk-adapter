@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.session import build_session_key
+from hermes_cli.config import get_hermes_home
 
 
 PLUGIN_DIR = Path(__file__).parent
@@ -29,8 +30,11 @@ assert platform_registry.is_registered("vk"), "VK platform entry did not registe
 os.environ["VK_TOKEN"] = "smoke-test-only"
 os.environ["VK_GROUP_ID"] = "987654321"
 os.environ["VK_ALLOWED_USERS"] = "123456789"
+os.environ.pop("VK_STATE_DIR", None)
 adapter = plugin.VkAdapter(PlatformConfig(enabled=True, extra={}))
 assert adapter.platform.value == "vk", "VK enum value did not resolve through platform registry"
+expected_cursor = Path(get_hermes_home()) / "plugin-data" / "vk-platform" / "vk-long-poll-987654321.json"
+assert Path(adapter._state_path()) == expected_cursor, "VK cursor must use Hermes' configured home"
 events = []
 
 
@@ -48,4 +52,4 @@ assert events[0].source.platform.value == "vk"
 assert events[0].source.chat_type == "dm"
 assert events[0].source.chat_id == events[1].source.chat_id == "123456789"
 assert build_session_key(events[0].source) == build_session_key(events[1].source), "same VK DM must resolve to one Hermes session"
-print("Hermes plugin registration, actual BasePlatformAdapter source, allowlist dispatch, and stable DM session: PASS")
+print("Hermes plugin registration, configured cursor path, actual BasePlatformAdapter source, allowlist dispatch, and stable DM session: PASS")

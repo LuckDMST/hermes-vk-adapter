@@ -19,3 +19,7 @@ optional_env:
     description: "Comma-separated numeric VK user IDs allowed to use the bot"
     prompt: "Allowed VK user IDs"
     password: false
+  - name: VK_STATE_DIR
+    description: "Optional absolute directory for private Long Poll cursor state"
+    prompt: "VK Long Poll state directory (optional)"
+    password: false
