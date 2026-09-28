@@ -1,132 +1,145 @@
 # Hermes VK Adapter
 
-VK (VKontakte) platform adapter for Hermes Agent, using the VK Bots Long Poll API.
-
-## Overview
-
-Hermes VK Adapter adds private VK community messages as a messaging platform handled by Hermes Agent. It is a Hermes platform plugin, not a separate AI bot or an HTTP bridge.
+Плагин подключает личные сообщения сообщества ВКонтакте к Hermes Agent. Он получает события через VK Bots Long Poll и отправляет ответы через VK API. Публичный IP, входящий порт и Callback API не нужны.
 
 ```text
-VK user → VK community → VK Bots Long Poll API → Hermes VK Adapter → Hermes Agent
-                                                                  ↓
-VK user ← VK community ← VK messages.send ← Hermes VK Adapter ← Hermes reply
+Пользователь VK → Сообщество VK → VK Bots Long Poll → Плагин → Hermes Agent
+Пользователь VK ← Сообщество VK ← VK messages.send ← Плагин ← Ответ Hermes
 ```
 
-The adapter makes an outbound Long Poll connection to VK. It does not need a public IP address, an inbound port, a webhook, or the VK Callback API.
+## Возможности и совместимость
 
-## Features and scope
+- Личные текстовые сообщения, ответы в тот же диалог и обычные сессии Hermes.
+- Ограничение входящих сообщений и исходящих ответов списком `VK_ALLOWED_USERS`.
+- Повторное подключение Long Poll и сохранение его курсора между перезапусками.
+- Разделение длинных ответов на сообщения допустимого размера.
 
-- Receives private messages sent to a VK community and sends Hermes replies to the same user.
-- Creates normal Hermes platform sessions; repeated messages use the same session identity.
-- Restricts inbound handling and outbound delivery to users in `VK_ALLOWED_USERS`.
-- Reconnects after Long Poll transport/API errors and resumes from its cursor after restart.
-- Splits long replies to fit VK's message size limit.
-- Initial version supports private text messages only. Group conversations, attachments, and other VK event types are not supported.
+Групповые беседы, вложения и другие события VK не поддерживаются. Интеграция проверена на установленном Hermes Agent **0.21.0**, revision `37f3ba110a1b537fe261d1e64c479fb37b3119af`, с VK API **5.199**. Другие версии Hermes не проверены. На этом экземпляре platform plugin был зарегистрирован, реальное сообщение прошло VK → Hermes → VK, повторное сообщение сохранило сессию, а подключение восстановилось после перезапуска контейнера.
 
-## Architecture
+## 1. Подготовь сообщество VK
 
-The adapter registers the `vk` platform through Hermes' platform plugin API. It calls `groups.getLongPollServer`, consumes community events using VK Bots Long Poll, converts allowed incoming text into Hermes `MessageEvent`s, and sends replies through `messages.send`. Hermes owns conversation/session history; the adapter stores only the Long Poll cursor.
+1. Включи сообщения сообщества.
+2. Создай **ключ доступа сообщества** с разрешениями **messages** и **manage**. В проверенной установке ключ только с `messages` давал ошибку VK `15` (subcode `1133`) при `groups.getLongPollServer`.
+3. Включи Long Poll API и событие **«Входящее сообщение»**. Проверенная версия VK API — `5.199`.
+4. Узнай числовой ID сообщества и числовые ID пользователей, которым разрешён доступ к Hermes.
 
-## Requirements and compatibility
+![Разрешения ключа сообщества](docs/images/03-create-token-permissions.png)
+![Включённый Long Poll](docs/images/04-long-poll-enabled.png)
+![Событие входящего сообщения](docs/images/05-long-poll-message-event.png)
+![Пример сообщества Hermes AI](docs/images/01-community-hermes-ai.png)
+![Включённые сообщения сообщества](docs/images/02-community-messages-enabled.png)
 
-- Hermes Agent platform plugin support. Verified against Hermes Agent `0.21.0`, revision `37f3ba110a1b537fe261d1e64c479fb37b3119af`. Other versions have not been verified.
-- VK API version `5.199`, used in the verified integration.
-- A VK community access token with **messages** and **manage** permissions. In the tested setup, `messages` alone returned VK error `15` (subcode `1133`) for `groups.getLongPollServer`.
-- Community messages and the Long Poll **Incoming message** event enabled.
+## 2. Найди постоянное хранилище Hermes в Docker
 
-## VK community setup
+Выполняй команды на Docker-хосте. Замени значения в угловых скобках фактическими именами своей установки. Имя контейнера можно найти командой `docker ps --format '{{.Names}}'`.
 
-1. Create or choose a VK community and enable community messages.
-2. Create a community access token with the **messages** and **manage** permissions. The `manage` permission is needed for `groups.getLongPollServer` in the verified setup.
-
-   ![Token permission selection](docs/images/03-create-token-permissions.png)
-
-3. Enable Long Poll and its incoming message event.
-
-   ![Long Poll enabled](docs/images/04-long-poll-enabled.png)
-   ![Incoming message event enabled](docs/images/05-long-poll-message-event.png)
-
-4. Install and enable the plugin using the mechanism supported by your Hermes version. On Hermes Agent `0.21.0`, the persistent plugin directory was `$HERMES_HOME/plugins/vk-platform`, and `hermes plugins enable vk-platform` enabled it. Keep the plugin on persistent storage when Hermes runs in a container; do not install it only into an ephemeral container filesystem.
-5. Configure the variables below using Hermes' supported environment or secret mechanism.
-6. Start or restart Hermes and verify that the `vk` platform connects.
-
-   ![VK community used in the verified setup](docs/images/01-community-hermes-ai.png)
-   ![Community messages enabled](docs/images/02-community-messages-enabled.png)
-
-## Configuration
-
-The adapter reads these environment variables:
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `VK_TOKEN` | Yes | Secret VK community access token. |
-| `VK_GROUP_ID` | Yes | Numeric ID of the VK community that owns the token. Replace the example with your community ID. |
-| `VK_ALLOWED_USERS` | Yes for message handling | Comma-separated numeric VK user IDs permitted to use the agent. Replace the example with the IDs you want to allow. |
-
-Example values below are fictitious:
-
-```dotenv
-VK_TOKEN=<your-community-token>
-VK_GROUP_ID=123456789
-VK_ALLOWED_USERS=12345678
+```sh
+CONTAINER='<имя-контейнера-Hermes>'
+docker exec "$CONTAINER" printenv HERMES_HOME
+docker inspect "$CONTAINER" --format '{{range .Mounts}}{{println .Type .Name .Source "->" .Destination}}{{end}}'
+docker inspect "$CONTAINER" --format '{{index .Config.Labels "com.docker.compose.service"}}'
+docker inspect "$CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project"}}'
+docker inspect "$CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'
+docker inspect "$CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
 ```
 
-Do not remove the allowlist. Hermes may have access to tools and private context, so allow only trusted VK user IDs. Keep the token in a secret manager or an untracked environment file with restrictive permissions.
+Первая команда показывает путь `HERMES_HOME` **внутри контейнера**. В списке mounts найди bind mount или Docker volume, чей `Destination` равен этому пути или является его родительским каталогом. `Source` у bind mount — путь на Docker-хосте; для named volume ориентируйся на его `Name`. Compose labels показывают service, project, Compose-файлы и рабочий каталог. Если конфигурация использует несколько `-f` или отдельный `--env-file`, укажи их в командах пересоздания в том же порядке, что и при обычном запуске. Если Compose labels отсутствуют, выясни эти параметры из конфигурации своей установки. Если `HERMES_HOME` не задан или каталог не покрыт постоянным mount, сначала настрой постоянное хранилище в существующей Docker-конфигурации и повтори проверку. Не устанавливай плагин только в файловый слой контейнера: при recreate он исчезнет.
 
-## Running and restarting Hermes
+## 3. Установи плагин в постоянный каталог
 
-Start or restart Hermes using the service or container manager for your installation. The plugin reconnects to VK Long Poll when Hermes starts the platform runtime. Its cursor is stored separately from conversation history, so the adapter can resume Long Poll after restart without taking ownership of Hermes sessions.
+Склонируй репозиторий на Docker-хост и скопируй файлы плагина **в смонтированный** `$HERMES_HOME/plugins/vk-platform`. Укажи адрес этого репозитория вместо шаблона и точный путь из шага 2. `docker cp` пишет в mount, если целевой каталог находится внутри подтверждённого постоянного mount.
 
-## Verification
+```sh
+git clone 'https://github.com/LuckDMST/hermes-vk-adapter.git' hermes-vk-adapter
+HERMES_HOME_IN_CONTAINER='<значение-HERMES_HOME-из-шага-2>'
+docker exec "$CONTAINER" mkdir -p "$HERMES_HOME_IN_CONTAINER/plugins/vk-platform"
+for file in plugin.yaml __init__.py adapter.py; do
+  docker cp "hermes-vk-adapter/$file" "$CONTAINER:$HERMES_HOME_IN_CONTAINER/plugins/vk-platform/$file"
+done
+docker exec "$CONTAINER" test -f "$HERMES_HOME_IN_CONTAINER/plugins/vk-platform/plugin.yaml"
+```
 
-1. Confirm Hermes platform status reports `vk` as connected.
-2. Send a direct message from an allowlisted VK account and confirm Hermes receives it.
-3. Confirm the reply appears in the same VK conversation.
-4. Send another message and verify that it continues the same Hermes session.
-5. Restart Hermes, send another message, and verify reconnection and session continuity.
-6. Send a message from a non-allowlisted account and verify it is ignored.
+При bind mount можно вместо `docker cp` скопировать файлы прямо в соответствующий каталог на Docker-хосте. Проверь, что `plugin.yaml` находится именно в `$HERMES_HOME/plugins/vk-platform/plugin.yaml` внутри контейнера. Сохрани существующие каталоги других плагинов.
 
-The screenshots document the VK → Hermes → VK exchange and connected status observed in the verified setup. They are examples, not a substitute for checking your own deployment.
+## 4. Передай настройки контейнеру
 
-![First VK message and Hermes reply](docs/images/06-vk-first-message.png)
-![Hermes session context after restart](docs/images/07-session-after-restart.png)
-![VK platform connected in Hermes](docs/images/08-hermes-vk-connected.png)
+Адаптер читает переменные окружения процесса Hermes:
 
-## Session persistence
+| Переменная | Значение |
+| --- | --- |
+| `VK_TOKEN` | Секретный ключ доступа **этого сообщества** с `messages` и `manage`. |
+| `VK_GROUP_ID` | Числовой ID сообщества, которому принадлежит ключ. |
+| `VK_ALLOWED_USERS` | Разделённые запятыми числовые ID разрешённых пользователей VK; хотя бы один ID обязателен. |
 
-The session identity is generated through Hermes' normal platform/session contract for a VK private conversation. The adapter persists only the Long Poll cursor. Hermes' configured session store handles conversation history.
+Добавь переменные в **существующее** определение Hermes service в Compose, `env_file` или используемый механизм передачи секретов. Например, если Compose уже получает значения из локального `.env` или хранилища секретов, в `environment` сервиса укажи:
 
-## Security
+```yaml
+environment:
+  VK_TOKEN: ${VK_TOKEN}
+  VK_GROUP_ID: ${VK_GROUP_ID}
+  VK_ALLOWED_USERS: ${VK_ALLOWED_USERS}
+```
 
-- Never commit `VK_TOKEN`, `.env` files, SSH keys, Long Poll keys, or runtime state/logs.
-- Grant the VK community token only the permissions required by this adapter: `messages` and `manage`.
-- Keep `VK_ALLOWED_USERS` configured and allow only trusted users.
+Значения помести в существующий защищённый источник окружения. Плагин читает именно переменные окружения, поэтому секрет, доступный только как файл Docker secrets, нужно передать ему через предусмотренный в твоей конфигурации механизм переменных. Не добавляй реальный токен в `compose.yaml`, Git, историю shell или отчёты команд. Пример формата без реальных значений находится в [.env.example](.env.example).
 
-## Troubleshooting
+После изменения окружения **пересоздай контейнер** через тот же Compose project и файл, которыми он управляется. Простой `docker restart` не применяет новые переменные. Определи Compose service командой из шага 2 или `docker compose -f '<путь-к-существующему-compose.yaml>' config --services`.
 
-- **`groups.getLongPollServer` returns error `15` / subcode `1133`:** verify that the configured token is a community token for `VK_GROUP_ID` and has both `messages` and `manage` permissions. In the verified setup, a token with only `messages` was insufficient.
-- **No incoming messages:** verify that community messages and Long Poll are enabled and that the **Incoming message** event is selected.
-- **The adapter connects but a user gets no response:** verify that the user's numeric VK ID is in `VK_ALLOWED_USERS`; users outside the allowlist are ignored.
-- **Token/community mismatch:** configure a community token belonging to the community identified by `VK_GROUP_ID`. Never paste the token into logs or support requests.
-- **Plugin not discovered:** verify that the plugin is in the persistent Hermes plugin directory, `plugin.yaml` is present, and the plugin is enabled using the mechanism supported by your Hermes version.
-- **A `Redirected current run` status appears in VK:** this status was observed once during a real integration check and originated in Hermes' gateway redirect path. The installed plugin send contract provides text but no confirmed message-origin marker, so the adapter cannot safely suppress only internal status messages without risking suppression of legitimate replies. This runtime limitation remains unresolved; a `v0.1.0` release/tag is deferred until the status can be distinguished or the VK path is verified again.
+```sh
+COMPOSE_FILE='<путь-к-существующему-compose.yaml>'
+SERVICE='<имя-сервиса-Hermes-в-этом-Compose>'
+COMPOSE_PROJECT='<имя-project-из-label-контейнера>'
+docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --no-deps --force-recreate "$SERVICE"
+```
 
-## Development and tests
+Если Hermes управляется не Compose, используй механизм пересоздания контейнера своей установки с сохранением всех существующих mounts, настроек и каналов. После recreate уточни текущее имя через `docker ps`; `CONTAINER` должен указывать на новый работающий контейнер.
 
-Run the Hermes-independent adapter tests:
+## 5. Включи плагин и запусти канал
+
+В проверенной версии Hermes CLI плагин включается так:
+
+```sh
+docker exec "$CONTAINER" hermes plugins enable vk-platform
+```
+
+Если gateway работал до включения плагина, перезапусти Hermes штатным способом своей установки, чтобы он загрузил платформу. В Compose это `docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" restart "$SERVICE"`. После запуска проверь статус Hermes: gateway должен работать, а платформа `vk` — быть подключена. Если подключения нет, проверь ошибки gateway, права ключа, соответствие `VK_GROUP_ID`, Long Poll и allowlist. Перед передачей логов другим людям убедись, что в них нет секретов.
+
+## 6. Проверь реальный обмен
+
+1. Отправь личное текстовое сообщение сообществу от пользователя из `VK_ALLOWED_USERS` и дождись ответа в том же диалоге.
+2. Отправь второе сообщение и проверь, что Hermes использует прежний контекст сессии.
+3. Проверь, что сообщение от пользователя вне allowlist не обрабатывается.
+4. Перезапусти или пересоздай контейнер штатным способом, дождись подключения `vk` и отправь ещё одно сообщение. Проверь ответ и сохранение контекста.
+
+Скриншоты проверенного обмена и статуса подключения приведены ниже. Локальные тесты не заменяют проверку с твоим сообществом и реальным Hermes.
+
+![Первый обмен VK и Hermes](docs/images/06-vk-first-message.png)
+![Сессия после перезапуска](docs/images/07-session-after-restart.png)
+![Подключённая платформа VK](docs/images/08-hermes-vk-connected.png)
+
+## Устранение неполадок
+
+- `groups.getLongPollServer` возвращает `15` / `1133`: проверь, что это ключ **сообщества**, принадлежащий `VK_GROUP_ID`, с разрешениями `messages` и `manage`. В проверенной установке причиной была нехватка `manage`.
+- Подключение есть, входящих сообщений нет: проверь сообщения сообщества, Long Poll и событие «Входящее сообщение».
+- Сообщение игнорируется: проверь числовой ID отправителя в `VK_ALLOWED_USERS`.
+- После recreate плагин пропал: проверь, что `$HERMES_HOME/plugins/vk-platform` расположен в постоянном bind mount или volume.
+- Сообщение `Redirected current run` создаётся Hermes gateway при перенаправлении запуска. В проверенном контракте исходящей отправки нет подтверждённого признака, по которому плагин мог бы безопасно отличить его от текста ответа. Фильтрация по фразе в адаптер не добавлена.
+
+## Разработка
+
+Локальные тесты адаптера:
 
 ```sh
 python -m unittest -v test_adapter.py
 ```
 
-Run the Hermes contract smoke test in an environment that can import the installed Hermes packages:
+Проверка контракта требует окружения, в котором доступны пакеты установленного Hermes:
 
 ```sh
 python smoke_hermes.py
 ```
 
-Unit tests, contract smoke tests, and automated checks do not constitute a live VK end-to-end test. A real end-to-end check requires a configured community token and verification of VK → Hermes → VK, allowlist behavior, reconnect, and restart/session persistence.
+Эти проверки не подтверждают успешный обмен VK → Hermes → VK. Для него нужны действующий ключ сообщества и шаги из раздела выше.
 
-## License
+## Лицензия
 
-MIT. See [LICENSE](LICENSE).
+MIT, см. [LICENSE](LICENSE).
