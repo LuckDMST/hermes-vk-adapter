@@ -1,0 +1,21 @@
+name: vk-platform
+label: VK
+kind: platform
+version: 0.1.0
+description: >
+  Private-message VK community channel for Hermes Agent using VK Bots Long Poll.
+author: LuckDMST
+requires_env:
+  - name: VK_TOKEN
+    description: "Community access token with messages and manage permissions"
+    prompt: "VK community access token"
+    password: true
+  - name: VK_GROUP_ID
+    description: "Numeric VK community ID"
+    prompt: "VK community ID"
+    password: false
+optional_env:
+  - name: VK_ALLOWED_USERS
+    description: "Comma-separated numeric VK user IDs allowed to use the bot"
+    prompt: "Allowed VK user IDs"
+    password: false
