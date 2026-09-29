@@ -20,7 +20,7 @@
 
 1. Включи сообщения сообщества.
 2. Создай **ключ доступа сообщества** с разрешениями **messages** и **manage**. В проверенной установке ключ только с `messages` давал ошибку VK `15` (subcode `1133`) при `groups.getLongPollServer`.
-3. Включи Long Poll API и событие **«Входящее сообщение»**. Проверенная версия VK API — `5.199`.
+3. Включи Long Poll API и событие **«Входящее сообщение»**. Для Unified Identity + Delivery v1 дополнительно включи **«Действие с сообщением»** (`message_event`): это событие доставляет нажатие кнопки `✅ Принял`. Проверенная версия VK API — `5.199`.
 4. Узнай числовой ID сообщества и числовые ID пользователей, которым разрешён доступ к Hermes.
 
 ![Разрешения ключа сообщества](docs/images/03-create-token-permissions.png)
@@ -114,6 +114,7 @@ docker exec "$CONTAINER" hermes plugins enable vk-platform
 2. Отправь второе сообщение и проверь, что Hermes использует прежний контекст сессии.
 3. Проверь, что сообщение от пользователя вне allowlist не обрабатывается.
 4. Перезапусти или пересоздай контейнер штатным способом, дождись подключения `vk` и отправь ещё одно сообщение. Проверь ответ и сохранение контекста.
+5. Если установлен Unified Identity + Delivery v1, проверь в логах `Unified delivery enabled: VK message_event verified`. Эта проверка читает `groups.getLongPollSettings` и подтверждает включение `events.message_event`, не выводя токен. Затем нажми `✅ Принял` на реальном VK-уведомлении и проверь подтверждение. Сообщение `Unified delivery disabled` в логах указывает на старый адаптер, отключённое событие или невозможность проверить настройку.
 
 Скриншоты проверенного обмена и статуса подключения приведены ниже. Локальные тесты не заменяют проверку с твоим сообществом и реальным Hermes.
 
@@ -125,6 +126,7 @@ docker exec "$CONTAINER" hermes plugins enable vk-platform
 
 - `groups.getLongPollServer` возвращает `15` / `1133`: проверь, что это ключ **сообщества**, принадлежащий `VK_GROUP_ID`, с разрешениями `messages` и `manage`. В проверенной установке причиной была нехватка `manage`.
 - Подключение есть, входящих сообщений нет: проверь сообщения сообщества, Long Poll и событие «Входящее сообщение».
+- `Unified delivery disabled` при работающих обычных VK-сообщениях: проверь событие «Действие с сообщением» (`message_event`) и версию адаптера с `set_message_event_handler`/`message_event_enabled`. Путь установки зависит от постоянного каталога данных конкретной установки.
 - Сообщение игнорируется: проверь числовой ID отправителя в `VK_ALLOWED_USERS`.
 - После recreate плагин пропал: проверь, что `$HERMES_HOME/plugins/vk-platform` расположен в постоянном bind mount или volume.
 - Сообщение `Redirected current run` создаётся Hermes gateway при перенаправлении запуска. В проверенном контракте исходящей отправки нет подтверждённого признака, по которому плагин мог бы безопасно отличить его от текста ответа. Фильтрация по фразе в адаптер не добавлена.
@@ -148,3 +150,16 @@ python smoke_hermes.py
 ## Лицензия
 
 MIT, см. [LICENSE](LICENSE).
+
+## VK callback и ACK transport
+
+Этот раздел описывает только транспортные возможности VK adapter. Generic identity mapping и delivery policy остаются в отдельном `hermes-unified-identity`.
+
+- Для кнопок ACK включи в настройках сообщества Long Poll событие «Действие с сообщением» (`message_event`) дополнительно к «Входящему сообщению» (`message_new`). Adapter при запуске проверяет `groups.getLongPollSettings` → `events.message_event`.
+- Callback keyboard отправляется через `messages.send` как inline keyboard с callback action и JSON payload. Callback принимается только от allowlisted пользователя в личном peer и передаётся зарегистрированному handler.
+- Чтобы получить обычный API message ID из `conversation_message_id` события, adapter вызывает `messages.getByConversationMessageId`.
+- Для подтверждения обработанного callback вызывается `messages.sendMessageEventAnswer`; VK показывает snackbar «Принято».
+- `edit_message(..., clear_keyboard=True)` использует `messages.edit` и очищает клавиатуру сообщения. `delete_message` использует `messages.delete` с `delete_for_all=1`.
+- Нужен community access token с правами `messages` и `manage`; `manage` требуется для чтения Long Poll settings. Секрет токена не включай в файлы проекта или логи.
+
+VK adapter предоставляет transport API; управление identity, состояниями уведомления, ACK policy и fallback выполняется отдельным generic расширением.

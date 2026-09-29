@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -257,6 +258,44 @@ class VkProtocolTests(unittest.TestCase):
         self.assertEqual([len(call.args[1]["message"]) for call in api_call.call_args_list], [4096, 904])
         self.assertEqual(denied.success, False)
         self.assertEqual(len(api_call.call_args_list), 2)
+
+    def test_unified_keyboard_uses_fixed_random_id(self):
+        instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+        instance.token = "test-token"
+        instance.allowed_users = {"123456789"}
+        keyboard = {"inline": True, "buttons": [[{"action": {"type": "callback", "label": "Принял", "payload": "{}"}}]]}
+        with patch.object(adapter, "vk_api_call", return_value=321) as api_call:
+            result = asyncio.run(instance.send("123456789", "notice", metadata={"unified_vk_keyboard": keyboard, "unified_vk_random_id": 99}))
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "321")
+        self.assertEqual(api_call.call_args.args[1]["random_id"], 99)
+        self.assertEqual(json.loads(api_call.call_args.args[1]["keyboard"]), keyboard)
+
+    def test_message_event_setting_is_read_from_community(self):
+        instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+        instance.token = "test-token"
+        instance.group_id = "987654321"
+        with patch.object(adapter, "vk_api_call", return_value={"events": {"message_event": 1}}) as api_call:
+            self.assertTrue(asyncio.run(instance.message_event_enabled()))
+        self.assertEqual(api_call.call_args.args[0], "groups.getLongPollSettings")
+        self.assertEqual(api_call.call_args.args[1]["group_id"], 987654321)
+        with patch.object(adapter, "vk_api_call", return_value={"events": {"message_event": 0}}):
+            self.assertFalse(asyncio.run(instance.message_event_enabled()))
+
+    def test_message_event_resolves_global_message_id_before_ack(self):
+        instance = adapter.VkAdapter(types.SimpleNamespace(extra={}))
+        instance.token = "test-token"
+        instance.allowed_users = {"123456789"}
+        callbacks = []
+        async def handle(data, **kwargs):
+            callbacks.append((data, kwargs))
+            return True
+        instance.set_message_event_handler(handle)
+        event = {"type": "message_event", "object": {"user_id": 123456789, "peer_id": 123456789, "event_id": "evt", "conversation_message_id": 17, "payload": {"hui": "reminder"}}}
+        with patch.object(adapter, "vk_api_call", side_effect=[{"items": [{"id": 321}]}, 1]) as api_call:
+            asyncio.run(instance._dispatch_update(event))
+        self.assertEqual(callbacks, [("hui:reminder", {"peer_id": "123456789", "user_id": "123456789", "message_id": "321"})])
+        self.assertEqual([call.args[0] for call in api_call.call_args_list], ["messages.getByConversationMessageId", "messages.sendMessageEventAnswer"])
 
     def test_long_poll_rejects_non_vk_or_plain_http_servers(self):
         for server in ("http://lp.vk.com/wh1", "https://example.org/longpoll", "https://vk.com.evil.test/wh1"):

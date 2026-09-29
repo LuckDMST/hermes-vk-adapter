@@ -255,6 +255,19 @@ class VkAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._typing_disabled = False
+        self._message_event_handler = None
+
+    def set_message_event_handler(self, handler) -> None:
+        """Register a trusted application callback; transport does not own ACK state."""
+        self._message_event_handler = handler
+
+    async def message_event_enabled(self) -> bool:
+        """Read the community's current Bots Long Poll callback-event setting."""
+        if not self.token or not self.group_id.isdecimal():
+            return False
+        settings = await asyncio.to_thread(vk_api_call, "groups.getLongPollSettings", {"group_id": int(self.group_id)}, self.token)
+        events = settings.get("events") if isinstance(settings, dict) else None
+        return bool(isinstance(events, dict) and events.get("message_event"))
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self._poll_task and not self._poll_task.done():
@@ -307,13 +320,25 @@ class VkAdapter(BasePlatformAdapter):
         if peer_id <= 0 or str(peer_id) not in self.allowed_users:
             return SendResult(success=False, error="VK target is not in VK_ALLOWED_USERS")
         chunks = split_vk_message(content)
+        metadata = metadata or {}
+        keyboard = metadata.get("unified_vk_keyboard")
+        fixed_random_id = metadata.get("unified_vk_random_id")
+        if keyboard is not None and not isinstance(keyboard, dict):
+            return SendResult(success=False, error="Invalid VK keyboard")
+        if fixed_random_id is not None and (not isinstance(fixed_random_id, int) or not 0 < fixed_random_id < 2_147_483_648):
+            return SendResult(success=False, error="Invalid VK random_id")
+        if (keyboard is not None or fixed_random_id is not None) and len(chunks) != 1:
+            return SendResult(success=False, error="VK callback messages must fit in one chunk")
         message_ids = []
         for index, chunk in enumerate(chunks):
+            params = {"peer_id": peer_id, "random_id": fixed_random_id or secrets.randbelow(2_147_483_647) + 1, "message": chunk}
+            if keyboard is not None:
+                params["keyboard"] = json.dumps(keyboard, ensure_ascii=False, separators=(",", ":"))
             try:
                 response = await asyncio.to_thread(
                     vk_api_call,
                     "messages.send",
-                    {"peer_id": peer_id, "random_id": secrets.randbelow(2_147_483_647) + 1, "message": chunk},
+                    params,
                     self.token,
                 )
             except VkApiError as error:
@@ -328,6 +353,28 @@ class VkAdapter(BasePlatformAdapter):
             message_id=message_ids[-1] if message_ids else None,
             raw_response={"chunk_ids": message_ids} if len(message_ids) > 1 else None,
         )
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *, clear_keyboard: bool = False) -> bool:
+        if str(chat_id) not in self.allowed_users or not str(message_id).isdecimal() or not self.token:
+            return False
+        params: dict[str, Any] = {"peer_id": int(chat_id), "message_id": int(message_id), "message": content}
+        if clear_keyboard:
+            params["keyboard"] = json.dumps({"inline": True, "buttons": []}, separators=(",", ":"))
+        try:
+            return bool(await asyncio.to_thread(vk_api_call, "messages.edit", params, self.token))
+        except (VkApiError, VkTransportError):
+            logger.warning("VK message edit failed")
+            return False
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        if str(chat_id) not in self.allowed_users or not str(message_id).isdecimal() or not self.token:
+            return False
+        try:
+            result = await asyncio.to_thread(vk_api_call, "messages.delete", {"message_ids": message_id, "delete_for_all": 1}, self.token)
+            return isinstance(result, dict) and str(result.get(str(message_id))) == "1"
+        except (VkApiError, VkTransportError):
+            logger.warning("VK message delete failed")
+            return False
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
         if self._typing_disabled or not self.token:
@@ -422,6 +469,9 @@ class VkAdapter(BasePlatformAdapter):
             logger.warning("VK Long Poll queue was reset by VK; resumed from the new cursor")
 
     async def _dispatch_update(self, update: Any) -> None:
+        if isinstance(update, dict) and update.get("type") == "message_event":
+            await self._dispatch_message_event(update)
+            return
         incoming = normalize_message_update(update, self.group_id)
         if incoming is None or incoming.user_id not in self.allowed_users:
             return
@@ -449,6 +499,42 @@ class VkAdapter(BasePlatformAdapter):
         self._seen.move_to_end(event_key)
         if len(self._seen) > _MAX_RECENT_EVENTS:
             self._seen.popitem(last=False)
+
+    async def _dispatch_message_event(self, update: dict[str, Any]) -> None:
+        event = update.get("object")
+        if not isinstance(event, dict) or self._message_event_handler is None:
+            return
+        user_id, peer_id = str(event.get("user_id", "")), str(event.get("peer_id", ""))
+        event_id = str(event.get("event_id", ""))
+        if not user_id.isdecimal() or user_id not in self.allowed_users or peer_id != user_id or not event_id:
+            return
+        payload = event.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                return
+        if not isinstance(payload, dict) or not isinstance(payload.get("hui"), str):
+            return
+        callback_data = f"hui:{payload['hui']}"
+        conversation_id = str(event.get("conversation_message_id", ""))
+        if not conversation_id.isdecimal():
+            return
+        try:
+            resolved = await asyncio.to_thread(vk_api_call, "messages.getByConversationMessageId", {"peer_id": int(peer_id), "conversation_message_ids": conversation_id}, self.token)
+            items = resolved.get("items", []) if isinstance(resolved, dict) else []
+            message_id = str(items[0].get("id", "")) if items else ""
+            if not message_id.isdecimal():
+                return
+            handled = await self._message_event_handler(callback_data, peer_id=peer_id, user_id=user_id, message_id=message_id)
+        except Exception:
+            logger.exception("VK message event handler failed")
+            return
+        if handled:
+            try:
+                await asyncio.to_thread(vk_api_call, "messages.sendMessageEventAnswer", {"event_id": event_id, "user_id": int(user_id), "peer_id": int(peer_id), "event_data": json.dumps({"type": "show_snackbar", "text": "Принято"}, ensure_ascii=False)}, self.token)
+            except (VkApiError, VkTransportError):
+                logger.warning("VK callback acknowledgement transport failed")
 
     async def _poll_loop(self) -> None:
         delay = _BACKOFF_INITIAL
